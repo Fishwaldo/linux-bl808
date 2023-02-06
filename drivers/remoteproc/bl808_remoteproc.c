@@ -21,7 +21,14 @@
 
 #include "remoteproc_internal.h"
 
-//#define MBOX_NB_MBX 1
+/**
+ * struct bl808_mbox - bl808 mailbox instance state
+ * @name: the name of the mailbox
+ * @client: the mailbox client
+ * @chan: the mailbox channel
+ * @vq_work: the workqueue for the virtqueue
+ * @vq_id: the virtqueue id
+ */
 
 struct bl808_mbox {
 	const unsigned char name[10];
@@ -44,49 +51,53 @@ struct bl808_rproc {
 	struct workqueue_struct *workqueue;
 };
 
-
+/* We have to fundge the resource table for the M0 
+ * as its already running firmware by the time Linux Loads
+ * and its not a ELF image, so these setup the Virtqueue,
+ * and RPMSG structures to communicate with it
+ */
 
 /* The feature bitmap for virtio rpmsg */
 #define VIRTIO_RPMSG_F_NS	0 /* RP supports name service notifications */
 
-#define FW_RSC_U32_ADDR_ANY 0xFFFFFFFFUL
+#define FW_RSC_U32_ADDR_ANY 	0xFFFFFFFFUL
 
-#define RPMSG_VDEV_DFEATURES        (1 << VIRTIO_RPMSG_F_NS)
+#define RPMSG_VDEV_DFEATURES	(1 << VIRTIO_RPMSG_F_NS)
 
 /* VirtIO rpmsg device id */
-#define VIRTIO_ID_RPMSG_             7
+#define VIRTIO_ID_RPMSG_	7
 
 /* Resource table entries */
-#define NUM_VRINGS                  0x02
-#define VRING_ALIGN                 0x1000
-#define RING_TX                     FW_RSC_U32_ADDR_ANY
-#define RING_RX                     FW_RSC_U32_ADDR_ANY
-#define VRING_SIZE                  8
+#define NUM_VRINGS		0x02
+#define VRING_ALIGN		0x1000
+#define RING_TX			FW_RSC_U32_ADDR_ANY
+#define RING_RX			FW_RSC_U32_ADDR_ANY
+/* VRING_SIZE is the number of VRINGS per TX/RX ring, so 
+ * actual number is double this. Size of the space needed
+ * is VRING_SIZE * 2 * MAX_RPMSG_BUF_SIZE 
+ */
+#define VRING_SIZE		8
+#define NUM_TABLE_ENTRIES	1
+#define NO_RESOURCE_ENTRIES	1
 
-#define NUM_TABLE_ENTRIES           1
-
-#define NO_RESOURCE_ENTRIES         1
-
-/* this is normally in the header of the ELF files for firmware
- * but since M0 is already running and there isn't a ELF file on
- * flash for it, we fudge the resource table header to statically
- * specify our virtio rings etc
+/* this is the structure of the Resource Table normally
+ * loaded from a ELF header. 
+ * its setup for just 1 VDEV entry, which is the RPMSG
+ * structure. We manually setup the vring's and vbuffers
+ * in our prepre op below. 
  */
 struct remote_resource_table {
 	u32 version;
 	u32 num;
 	u32 reserved[2];
 	u32 offset[NO_RESOURCE_ENTRIES];
-	/* rpmsg vdev entry */
-	u32 type;
+	u32 type; /* the vdev type that follows */
 	struct fw_rsc_vdev rpmsg_vdev;
 	struct fw_rsc_vdev_vring rpmsg_vring0;
 	struct fw_rsc_vdev_vring rpmsg_vring1;
 } __packed;
 
-/* this is our fudged ELF Resource Table Header setup with
- * one rpmsg virtio device and two virtio rings
- */
+/* Setup one RPMSG VDEV and two VRINGs */
 struct remote_resource_table resources = {
 	/* Version */
 	.version = 1,
@@ -108,18 +119,13 @@ struct remote_resource_table resources = {
 	},
 
 	/* Vring rsc entry - part of vdev rsc entry */
-	{0x22048000, VRING_ALIGN, VRING_SIZE, 0, 0x22048000},
-	{0x2204C000, VRING_ALIGN, VRING_SIZE, 1, 0x2204C000},
+	{FW_RSC_U32_ADDR_ANY, VRING_ALIGN, VRING_SIZE, 0, 0},
+	{FW_RSC_U32_ADDR_ANY, VRING_ALIGN, VRING_SIZE, 1, 0},
 };
 
-/* return a pointer to our resource table
- */
+/* return a pointer to our resource table */
 struct resource_table *bl808_rproc_get_loaded_rsc_table(struct rproc *rproc, size_t *size)
 {
-	struct device *dev = rproc->dev.parent;
-
-	dev_dbg(dev, "bl808_rproc_get_loaded_rsc_table");
-
 	*size = sizeof(resources);
 	return (struct resource_table *)&resources;
 }
@@ -131,8 +137,6 @@ static int bl808_rproc_mem_alloc(struct rproc *rproc,
 	struct device *dev = rproc->dev.parent;
 	void *va;
 
-	dev_dbg(dev, "Allocating memory region");
-
 	va = ioremap_wc(mem->dma, mem->len);
 	if (!va) {
 		dev_err(dev, "Unable to map memory region: %pa+%zx\n",
@@ -142,7 +146,6 @@ static int bl808_rproc_mem_alloc(struct rproc *rproc,
 
 	/* Update memory entry va */
 	mem->va = va;
-	dev_dbg(dev, "Allocated memory region: %pa+%zx -> %p", &mem->dma, mem->len, mem->va);
 
 	return 0;
 }
@@ -151,17 +154,14 @@ static int bl808_rproc_mem_alloc(struct rproc *rproc,
 static int bl808_rproc_mem_release(struct rproc *rproc,
 				struct rproc_mem_entry *mem)
 {
-	struct device *dev = rproc->dev.parent;
-
-	dev_dbg(dev, "release memory region");
-
 	iounmap(mem->va);
 
 	return 0;
 }
 
 /*
- * Pull the memory ranges for virtio from the device tree and register them
+ * Pull the memory ranges for virtio from the device tree and register them.
+ * Called as prepare. 
  */
 static int bl808_rproc_setupmem(struct rproc *rproc)
 {
@@ -172,22 +172,19 @@ static int bl808_rproc_setupmem(struct rproc *rproc)
 	struct of_phandle_iterator it;
 	int index = 0;
 
-	dev_dbg(dev, "bl808_rproc_parse_fw %s", np->name);
+	dev_dbg(dev, "%s %s", __func__, np->name);
 
 	of_phandle_iterator_init(&it, np, "memory-region", NULL, 0);
 	while (of_phandle_iterator_next(&it) == 0) {
-		dev_dbg(dev, "memory-region %s", it.node->name);
 		rmem = of_reserved_mem_lookup(it.node);
 		if (!rmem) {
 			dev_err(dev, "unable to acquire memory-region\n");
 			return -EINVAL;
 		}
-		dev_dbg(dev, "memory-region %s", it.node->name);
 
 		/*  No need to map vdev buffer */
 		if (strcmp(it.node->name, "vdev0buffer")) {
 			/* Register memory region */
-			dev_dbg(dev, "registering memory region %s %llx", it.node->name, rmem->base);
 			mem = rproc_mem_entry_init(dev, NULL,
 						   (dma_addr_t)rmem->base,
 						   rmem->size, rmem->base,
@@ -196,7 +193,6 @@ static int bl808_rproc_setupmem(struct rproc *rproc)
 						   it.node->name);
 		} else {
 			/* Register reserved memory for vdev buffer allocation */
-			dev_dbg(dev, "registering reserved memory region %s %llx", it.node->name, rmem->base);
 			mem = rproc_of_resm_mem_entry_init(dev, index,
 							   rmem->size,
 							   rmem->base,
@@ -240,7 +236,7 @@ static void bl808_rproc_kick(struct rproc *rproc, int vqid)
 {
 	struct device *dev = rproc->dev.parent;
 	struct bl808_rproc *drproc = (struct bl808_rproc *)rproc->priv;
-
+	
 	/* Kick the other CPU to let it know the vrings are updated */
 	dev_dbg(dev, "%s %d", __func__, vqid);
 	mbox_send_message(drproc->mbox.chan, (void *)vqid);
@@ -266,8 +262,6 @@ static void bflb_rproc_mbox_callback(struct mbox_client *client, void *data)
 	struct bl808_mbox *mb = &drproc->mbox;
 
 	mb->vq_id = (u32)data;
-
-	dev_dbg(dev, "%s %d", __func__, mb->vq_id);
 
 	queue_work(drproc->workqueue, &mb->vq_work);
 }
@@ -299,8 +293,8 @@ static int bl808_rproc_attach(struct rproc *rproc)
 		return ret;
 	}
 	INIT_WORK(&chan->vq_work, bflb_rproc_mb_vq_work);
+	dev_info(dev, "Attaching to %s", rproc->name);
 
-	dev_dbg(dev, "%s: Attaching to %s", __func__, rproc->name);
 	return 0;
 }
 
@@ -309,7 +303,8 @@ static int bl808_rproc_detach(struct rproc *rproc)
 {
 	struct device *dev = rproc->dev.parent;
 
-	dev_dbg(dev, "%s: Detaching from %s", __func__, rproc->name);
+	
+	dev_info(dev, "Detaching from %s", rproc->name);
 	return 0;
 }
 
@@ -364,7 +359,7 @@ static int bl808_rproc_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, rproc);
 
-	dev_dbg(dev, "rproc_add success");
+	dev_info(dev, "Bouffalo Labs Remote Processor Control Driver Started");
 
 	return 0;
 
@@ -384,7 +379,7 @@ static int bl808_rproc_remove(struct platform_device *pdev)
 	struct bl808_rproc *drproc = (struct bl808_rproc *)rproc->priv;
 	struct device *dev = &pdev->dev;
 
-	dev_dbg(dev, "bl808_rproc_remove");
+	dev_info(dev, "Bouffalo Labs Remote Processor Control Driver Removed");
 
 	/*XXX TODO: we need to unregister our mailbox? */
 
