@@ -61,15 +61,15 @@ struct bl808_rproc {
 #define VRING_ALIGN                 0x1000
 #define RING_TX                     FW_RSC_U32_ADDR_ANY
 #define RING_RX                     FW_RSC_U32_ADDR_ANY
-#define VRING_SIZE                  4
+#define VRING_SIZE                  8
 
 #define NUM_TABLE_ENTRIES           1
 
 #define NO_RESOURCE_ENTRIES         1
 
 /* this is normally in the header of the ELF files for firmware
- * but since M0 is already running and there isn't a ELF file on 
- * flash for it, we fudge the resource table header to statically 
+ * but since M0 is already running and there isn't a ELF file on
+ * flash for it, we fudge the resource table header to statically
  * specify our virtio rings etc
  */
 struct remote_resource_table {
@@ -82,9 +82,9 @@ struct remote_resource_table {
 	struct fw_rsc_vdev rpmsg_vdev;
 	struct fw_rsc_vdev_vring rpmsg_vring0;
 	struct fw_rsc_vdev_vring rpmsg_vring1;
-}__packed;
+} __packed;
 
-/* this is our fudged ELF Resource Table Header setup with 
+/* this is our fudged ELF Resource Table Header setup with
  * one rpmsg virtio device and two virtio rings
  */
 struct remote_resource_table resources = {
@@ -93,7 +93,7 @@ struct remote_resource_table resources = {
 
 	/* NUmber of table entries */
 	.num = NUM_TABLE_ENTRIES,
-	
+
 	/* reserved fields */
 	.reserved = {0, 0,},
 
@@ -112,11 +112,12 @@ struct remote_resource_table resources = {
 	{0x2204C000, VRING_ALIGN, VRING_SIZE, 1, 0x2204C000},
 };
 
-/* return a pointer to our resource table 
+/* return a pointer to our resource table
  */
 struct resource_table *bl808_rproc_get_loaded_rsc_table(struct rproc *rproc, size_t *size)
 {
 	struct device *dev = rproc->dev.parent;
+
 	dev_dbg(dev, "bl808_rproc_get_loaded_rsc_table");
 
 	*size = sizeof(resources);
@@ -140,8 +141,8 @@ static int bl808_rproc_mem_alloc(struct rproc *rproc,
 	}
 
 	/* Update memory entry va */
-    mem->va = va;
-	dev_dbg(dev, "Allocated memory region: %pa+%zx -> %px", &mem->dma, mem->len, mem->va);
+	mem->va = va;
+	dev_dbg(dev, "Allocated memory region: %pa+%zx -> %p", &mem->dma, mem->len, mem->va);
 
 	return 0;
 }
@@ -159,7 +160,7 @@ static int bl808_rproc_mem_release(struct rproc *rproc,
 	return 0;
 }
 
-/* 
+/*
  * Pull the memory ranges for virtio from the device tree and register them
  */
 static int bl808_rproc_setupmem(struct rproc *rproc)
@@ -213,7 +214,7 @@ static int bl808_rproc_setupmem(struct rproc *rproc)
 }
 
 
-/* M0 is already started. Do Nothing 
+/* M0 is already started. Do Nothing
  */
 static int bl808_rproc_start(struct rproc *rproc)
 {
@@ -224,8 +225,7 @@ static int bl808_rproc_start(struct rproc *rproc)
 	return 0;
 }
 
-/* We don't want to stop M0, as it will crash. Do Nothing
-*/
+/* We don't want to stop M0, as it will crash. Do Nothing */
 static int bl808_rproc_stop(struct rproc *rproc)
 {
 	struct device *dev = rproc->dev.parent;
@@ -235,16 +235,15 @@ static int bl808_rproc_stop(struct rproc *rproc)
 	return 0;
 }
 
-/* kick the virtqueue to let M0 know there is a update to the vring
- */
+/* kick the virtqueue to let M0 know there is a update to the vring */
 static void bl808_rproc_kick(struct rproc *rproc, int vqid)
 {
 	struct device *dev = rproc->dev.parent;
 	struct bl808_rproc *drproc = (struct bl808_rproc *)rproc->priv;
 
 	/* Kick the other CPU to let it know the vrings are updated */
-	dev_dbg(dev, "bl808_rproc_kick %d", vqid);
-	mbox_send_message(drproc->mbox.chan, (void*)vqid);
+	dev_dbg(dev, "%s %d", __func__, vqid);
+	mbox_send_message(drproc->mbox.chan, (void *)vqid);
 }
 
 static void bflb_rproc_mb_vq_work(struct work_struct *work)
@@ -268,22 +267,13 @@ static void bflb_rproc_mbox_callback(struct mbox_client *client, void *data)
 
 	mb->vq_id = (u32)data;
 
-	dev_dbg(dev, "bflb_rproc_mbox_callback %d", mb->vq_id);
+	dev_dbg(dev, "%s %d", __func__, mb->vq_id);
 
 	queue_work(drproc->workqueue, &mb->vq_work);
-
-//	if (vqid > 0 && vqid < 3) {
-//		rproc_vq_interrupt(rproc, vqid);
-		// rproc_vq_interrupt(rproc, 0);
-		// pr_debug("rproc_vq_interrupt 0");
-		// rproc_vq_interrupt(rproc, 1);
-		// pr_debug("rproc_vq_interrupt 1");
-//	} else
-//		dev_err(dev, "bflb_rproc_mbox_callback: Invalid vqid %d", vqid);
 }
 
 /* M0 is already running when we boot
- * so just attach to it. 
+ * so just attach to it.
  * we also register a mailbox to get kicks from M0 when vrings are updated
  */
 static int bl808_rproc_attach(struct rproc *rproc)
@@ -310,21 +300,18 @@ static int bl808_rproc_attach(struct rproc *rproc)
 	}
 	INIT_WORK(&chan->vq_work, bflb_rproc_mb_vq_work);
 
-
-	dev_dbg(dev, "bl808_rproc_attach: Attaching to %s", rproc->name);
+	dev_dbg(dev, "%s: Attaching to %s", __func__, rproc->name);
 	return 0;
 }
 
 /* Detach. Do Nothing? */
-
 static int bl808_rproc_detach(struct rproc *rproc)
 {
 	struct device *dev = rproc->dev.parent;
 
-	dev_dbg(dev, "bl808_rproc_detach: Detaching from %s", rproc->name);
+	dev_dbg(dev, "%s: Detaching from %s", __func__, rproc->name);
 	return 0;
 }
-
 
 static const struct rproc_ops bl808_rproc_ops = {
 	.start = bl808_rproc_start,
@@ -343,8 +330,6 @@ static int bl808_rproc_probe(struct platform_device *pdev)
 	struct bl808_rproc *drproc;
 	struct rproc *rproc;
 	int ret;
-
-	dev_dbg(dev, "bl808_rproc_probe ");
 
 	rproc = rproc_alloc(dev, "M0", &bl808_rproc_ops, NULL,
 		sizeof(*drproc));
