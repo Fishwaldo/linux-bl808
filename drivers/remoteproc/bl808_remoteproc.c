@@ -51,7 +51,7 @@ struct bl808_rproc {
 	struct workqueue_struct *workqueue;
 };
 
-/* We have to fundge the resource table for the M0 
+/* We have to fundge the resource table for the M0
  * as its already running firmware by the time Linux Loads
  * and its not a ELF image, so these setup the Virtqueue,
  * and RPMSG structures to communicate with it
@@ -60,7 +60,7 @@ struct bl808_rproc {
 /* The feature bitmap for virtio rpmsg */
 #define VIRTIO_RPMSG_F_NS	0 /* RP supports name service notifications */
 
-#define FW_RSC_U32_ADDR_ANY 	0xFFFFFFFFUL
+#define FW_RSC_U32_ADDR_ANY	0xFFFFFFFFUL
 
 #define RPMSG_VDEV_DFEATURES	(1 << VIRTIO_RPMSG_F_NS)
 
@@ -72,19 +72,19 @@ struct bl808_rproc {
 #define VRING_ALIGN		0x1000
 #define RING_TX			FW_RSC_U32_ADDR_ANY
 #define RING_RX			FW_RSC_U32_ADDR_ANY
-/* VRING_SIZE is the number of VRINGS per TX/RX ring, so 
+/* VRING_SIZE is the number of VRINGS per TX/RX ring, so
  * actual number is double this. Size of the space needed
- * is VRING_SIZE * 2 * MAX_RPMSG_BUF_SIZE 
+ * is VRING_SIZE * 2 * MAX_RPMSG_BUF_SIZE
  */
 #define VRING_SIZE		8
 #define NUM_TABLE_ENTRIES	1
 #define NO_RESOURCE_ENTRIES	1
 
 /* this is the structure of the Resource Table normally
- * loaded from a ELF header. 
+ * loaded from a ELF header.
  * its setup for just 1 VDEV entry, which is the RPMSG
  * structure. We manually setup the vring's and vbuffers
- * in our prepre op below. 
+ * in our prepre op below.
  */
 struct remote_resource_table {
 	u32 version;
@@ -161,7 +161,7 @@ static int bl808_rproc_mem_release(struct rproc *rproc,
 
 /*
  * Pull the memory ranges for virtio from the device tree and register them.
- * Called as prepare. 
+ * Called as prepare.
  */
 static int bl808_rproc_setupmem(struct rproc *rproc)
 {
@@ -236,7 +236,7 @@ static void bl808_rproc_kick(struct rproc *rproc, int vqid)
 {
 	struct device *dev = rproc->dev.parent;
 	struct bl808_rproc *drproc = (struct bl808_rproc *)rproc->priv;
-	
+
 	/* Kick the other CPU to let it know the vrings are updated */
 	dev_dbg(dev, "%s %d", __func__, vqid);
 	mbox_send_message(drproc->mbox.chan, (void *)vqid);
@@ -303,7 +303,6 @@ static int bl808_rproc_detach(struct rproc *rproc)
 {
 	struct device *dev = rproc->dev.parent;
 
-	
 	dev_info(dev, "Detaching from %s", rproc->name);
 	return 0;
 }
