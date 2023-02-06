@@ -21,6 +21,16 @@
 
 #include "remoteproc_internal.h"
 
+//#define MBOX_NB_MBX 1
+
+struct bl808_mbox {
+	const unsigned char name[10];
+	struct mbox_client client;
+	struct mbox_chan *chan;
+	struct work_struct vq_work;
+	int vq_id;
+};
+
 
 /**
  * struct bl808_rproc - bl808 remote processor instance state
@@ -30,9 +40,11 @@
  */
 struct bl808_rproc {
 	struct rproc *rproc;
-	struct mbox_chan *mbox;
-	struct mbox_client client;
+	struct bl808_mbox mbox;
+	struct workqueue_struct *workqueue;
 };
+
+
 
 /* The feature bitmap for virtio rpmsg */
 #define VIRTIO_RPMSG_F_NS	0 /* RP supports name service notifications */
@@ -49,7 +61,7 @@ struct bl808_rproc {
 #define VRING_ALIGN                 0x1000
 #define RING_TX                     FW_RSC_U32_ADDR_ANY
 #define RING_RX                     FW_RSC_U32_ADDR_ANY
-#define VRING_SIZE                  2
+#define VRING_SIZE                  4
 
 #define NUM_TABLE_ENTRIES           1
 
@@ -96,8 +108,8 @@ struct remote_resource_table resources = {
 	},
 
 	/* Vring rsc entry - part of vdev rsc entry */
-	{RING_TX, VRING_ALIGN, VRING_SIZE, 1, 0},
-	{RING_RX, VRING_ALIGN, VRING_SIZE, 2, 0},
+	{0x22048000, VRING_ALIGN, VRING_SIZE, 0, 0x22048000},
+	{0x2204C000, VRING_ALIGN, VRING_SIZE, 1, 0x2204C000},
 };
 
 /* return a pointer to our resource table 
@@ -129,7 +141,7 @@ static int bl808_rproc_mem_alloc(struct rproc *rproc,
 
 	/* Update memory entry va */
     mem->va = va;
-	dev_dbg(dev, "Allocated memory region: %pa+%zx -> %p", &mem->dma, mem->len, mem->va);
+	dev_dbg(dev, "Allocated memory region: %pa+%zx -> %px", &mem->dma, mem->len, mem->va);
 
 	return 0;
 }
@@ -174,7 +186,7 @@ static int bl808_rproc_setupmem(struct rproc *rproc)
 		/*  No need to map vdev buffer */
 		if (strcmp(it.node->name, "vdev0buffer")) {
 			/* Register memory region */
-			dev_dbg(dev, "registering memory region %s", it.node->name);
+			dev_dbg(dev, "registering memory region %s %llx", it.node->name, rmem->base);
 			mem = rproc_mem_entry_init(dev, NULL,
 						   (dma_addr_t)rmem->base,
 						   rmem->size, rmem->base,
@@ -183,7 +195,7 @@ static int bl808_rproc_setupmem(struct rproc *rproc)
 						   it.node->name);
 		} else {
 			/* Register reserved memory for vdev buffer allocation */
-			dev_dbg(dev, "registering reserved memory region %s", it.node->name);
+			dev_dbg(dev, "registering reserved memory region %s %llx", it.node->name, rmem->base);
 			mem = rproc_of_resm_mem_entry_init(dev, index,
 							   rmem->size,
 							   rmem->base,
@@ -232,8 +244,18 @@ static void bl808_rproc_kick(struct rproc *rproc, int vqid)
 
 	/* Kick the other CPU to let it know the vrings are updated */
 	dev_dbg(dev, "bl808_rproc_kick %d", vqid);
-	mbox_send_message(drproc->mbox, (void*)vqid);
+	mbox_send_message(drproc->mbox.chan, (void*)vqid);
 }
+
+static void bflb_rproc_mb_vq_work(struct work_struct *work)
+{
+	struct bl808_mbox *mb = container_of(work, struct bl808_mbox, vq_work);
+	struct rproc *rproc = dev_get_drvdata(mb->client.dev);
+
+	if (rproc_vq_interrupt(rproc, mb->vq_id) == IRQ_NONE)
+		dev_dbg(&rproc->dev, "no message found in vq%d\n", mb->vq_id);
+}
+
 
 /* M0 signaled us there is a update on the vring, check it
  */
@@ -241,14 +263,23 @@ static void bflb_rproc_mbox_callback(struct mbox_client *client, void *data)
 {
 	struct device *dev = client->dev;
 	struct rproc *rproc = dev_get_drvdata(dev);
-	u32 vqid = (u32)data;
+	struct bl808_rproc *drproc = (struct bl808_rproc *)rproc->priv;
+	struct bl808_mbox *mb = &drproc->mbox;
 
-	dev_dbg(dev, "bflb_rproc_mbox_callback %d", vqid);
+	mb->vq_id = (u32)data;
 
-	if (vqid > 0 && vqid < 3)
-		rproc_vq_interrupt(rproc, vqid);
-	else
-		dev_err(dev, "bflb_rproc_mbox_callback: Invalid vqid %d", vqid);
+	dev_dbg(dev, "bflb_rproc_mbox_callback %d", mb->vq_id);
+
+	queue_work(drproc->workqueue, &mb->vq_work);
+
+//	if (vqid > 0 && vqid < 3) {
+//		rproc_vq_interrupt(rproc, vqid);
+		// rproc_vq_interrupt(rproc, 0);
+		// pr_debug("rproc_vq_interrupt 0");
+		// rproc_vq_interrupt(rproc, 1);
+		// pr_debug("rproc_vq_interrupt 1");
+//	} else
+//		dev_err(dev, "bflb_rproc_mbox_callback: Invalid vqid %d", vqid);
 }
 
 /* M0 is already running when we boot
@@ -259,24 +290,26 @@ static int bl808_rproc_attach(struct rproc *rproc)
 {
 	struct device *dev = &rproc->dev;
 	struct bl808_rproc *drproc = (struct bl808_rproc *)rproc->priv;
+	struct mbox_client *vq1_mbox = &drproc->mbox.client;
+	struct bl808_mbox *chan = &drproc->mbox;
 	int ret;
 
-	/* request the mailbox */
-	struct mbox_client *vq1_mbox = &drproc->client;
+	/* request the mailboxs */
 	vq1_mbox->dev = dev->parent;
-	dev_dbg(vq1_mbox->dev, "bl808_rproc_attachasdfadfsdf: Attaching to %s", rproc->name);
 	vq1_mbox->tx_done = NULL;
 	vq1_mbox->rx_callback = bflb_rproc_mbox_callback;
 	vq1_mbox->tx_block = false;
 	vq1_mbox->knows_txdone = false;
 
-	drproc->mbox = mbox_request_channel(vq1_mbox, 0);
-	if (IS_ERR(drproc->mbox)) {
+	chan->chan = mbox_request_channel(vq1_mbox, 0);
+	if (IS_ERR(chan->chan)) {
 		ret = -EBUSY;
 		dev_err(dev, "mbox_request_channel failed: %ld\n",
-			PTR_ERR(drproc->mbox));
+			PTR_ERR(chan->chan));
 		return ret;
 	}
+	INIT_WORK(&chan->vq_work, bflb_rproc_mb_vq_work);
+
 
 	dev_dbg(dev, "bl808_rproc_attach: Attaching to %s", rproc->name);
 	return 0;
@@ -291,6 +324,7 @@ static int bl808_rproc_detach(struct rproc *rproc)
 	dev_dbg(dev, "bl808_rproc_detach: Detaching from %s", rproc->name);
 	return 0;
 }
+
 
 static const struct rproc_ops bl808_rproc_ops = {
 	.start = bl808_rproc_start,
@@ -330,6 +364,13 @@ static int bl808_rproc_probe(struct platform_device *pdev)
 	drproc->rproc = rproc;
 	rproc->has_iommu = false;
 
+	drproc->workqueue = create_workqueue(dev_name(dev));
+	if (!drproc->workqueue) {
+		dev_err(dev, "cannot create workqueue\n");
+		ret = -ENOMEM;
+		goto free_wkq;
+	}
+
 	ret = rproc_add(rproc);
 	if (ret) {
 		dev_err(dev, "rproc_add failed: %d\n", ret);
@@ -342,6 +383,8 @@ static int bl808_rproc_probe(struct platform_device *pdev)
 
 	return 0;
 
+free_wkq:
+	destroy_workqueue(drproc->workqueue);
 free_rproc:
 	rproc_free(rproc);
 free_mem:
@@ -353,11 +396,14 @@ free_mem:
 static int bl808_rproc_remove(struct platform_device *pdev)
 {
 	struct rproc *rproc = platform_get_drvdata(pdev);
+	struct bl808_rproc *drproc = (struct bl808_rproc *)rproc->priv;
 	struct device *dev = &pdev->dev;
 
 	dev_dbg(dev, "bl808_rproc_remove");
 
 	/*XXX TODO: we need to unregister our mailbox? */
+
+	destroy_workqueue(drproc->workqueue);
 
 	rproc_del(rproc);
 	rproc_free(rproc);

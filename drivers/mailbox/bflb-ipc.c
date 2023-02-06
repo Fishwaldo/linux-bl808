@@ -195,7 +195,7 @@ static const struct irq_domain_ops bflb_ipc_irq_ops = {
 /* JH: Figure out if M0 has processed the last signal sent
  * by checking if the High/Low registers are cleared
  */
-static int bflb_ipc_mbox_can_send(struct mbox_chan *chan)
+static bool bflb_ipc_mbox_can_send(struct mbox_chan *chan)
 {
 	struct bflb_ipc *ipc = to_bflb_ipc(chan->mbox);
 
@@ -214,9 +214,10 @@ static int bflb_ipc_mbox_send_data(struct mbox_chan *chan, void *data)
 	struct bflb_ipc *ipc = to_bflb_ipc(chan->mbox);
 	struct bflb_ipc_chan_info *mchan = chan->con_priv;
 
-	if (!bflb_ipc_mbox_can_send(chan))
+	if (!bflb_ipc_mbox_can_send(chan)) {
+		dev_dbg(ipc->dev, "MBOX is busy");
 		return -EBUSY;
-
+	}
 
 	dev_dbg(ipc->dev, "%s: %d %d\n", __func__, mchan->client_id, mchan->signal_id);
 
@@ -283,6 +284,7 @@ static struct mbox_chan *bflb_ipc_mbox_xlate(struct mbox_controller *mbox,
 static const struct mbox_chan_ops ipc_mbox_chan_ops = {
 	.send_data = bflb_ipc_mbox_send_data,
 	.shutdown = bflb_ipc_mbox_shutdown,
+	.last_tx_done = bflb_ipc_mbox_can_send,
 };
 
 static int bflb_ipc_setup_mbox(struct bflb_ipc *ipc,
@@ -332,7 +334,8 @@ static int bflb_ipc_setup_mbox(struct bflb_ipc *ipc,
 	mbox->ops = &ipc_mbox_chan_ops;
 	mbox->of_xlate = bflb_ipc_mbox_xlate;
 	mbox->txdone_irq = false;
-	mbox->txdone_poll = false;
+	mbox->txdone_poll = true;
+
 
 
 	/* clear the IPC_REG_ILSLR and IPC_REG_ILSHR */
