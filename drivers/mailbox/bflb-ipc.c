@@ -25,12 +25,14 @@
 
 /**
  * struct bflb_ipc_chan_info - Per-mailbox-channel info
- * @client_id:	The client-id to which the interrupt has to be triggered
- * @signal_id:	The signal-id to which the interrupt has to be triggered
+ * @cpu_id:	The cpu_id is a identifier of what CPU is being called
+ * @service_id:	The service_id is a identifier of what service is being called on the remote CPU
+ * @op_id:	The operation we want to execute on the remote CPU
  */
 struct bflb_ipc_chan_info {
-	u16 client_id;
-	u16 signal_id;
+	u8  cpu_id;
+	u16 service_id;
+	u16 op_id;
 };
 
 /**
@@ -39,7 +41,8 @@ struct bflb_ipc_chan_info {
  * @base:		Base address of each IPC frame (LP, M0)
  * @irq_domain:		The irq_domain associated with this instance
  * @chans:		The mailbox channels array
- * @mchan:		The per-mailbox channel info array
+ * @outchat:		The outbound (singal the other CPU) mailbox channel info
+ * @inchan:		The inbound (receive the signal from the other CPU) mailbox channel info
  * @mbox:		The mailbox controller
  * @num_chans:		Number of @chans elements
  * @irq:		Summary irq
@@ -49,15 +52,15 @@ struct bflb_ipc {
 	void __iomem *base[4];
 	struct irq_domain *irq_domain;
 	struct mbox_chan *chans;
-	struct bflb_ipc_chan_info *mchan;
-	struct mbox_controller mbox;
+	struct bflb_ipc_chan_info *bflbchan;
+	struct mbox_controller mboxctlr;
 	int num_chans;
 	int irq;
 };
 
-static inline struct bflb_ipc *to_bflb_ipc(struct mbox_controller *mbox)
+static inline struct bflb_ipc *to_bflb_ipc(struct mbox_controller *mboxctlr)
 {
-	return container_of(mbox, struct bflb_ipc, mbox);
+	return container_of(mboxctlr, struct bflb_ipc, mboxctlr);
 }
 
 static inline u32 bflb_ipc_get_hwirq(u16 source, u16 device)
@@ -67,6 +70,7 @@ static inline u32 bflb_ipc_get_hwirq(u16 source, u16 device)
 	
 	return device;
 }
+
 
 #if 0
 static void bflb_ipc_dump_regs(struct bflb_ipc *ipc)
@@ -86,29 +90,97 @@ static void bflb_ipc_dump_regs(struct bflb_ipc *ipc)
 }
 #endif
 
-/* check the High/Low registers for the MBOX and send it off to 
- * the mailbox. 
- * JH: I'm guessing Source should map to the mailbox? But I've only allocated a single 
- * mailbox so far, so its discarded.
+struct mbox_chan *bflb_mbox_find_chan(struct bflb_ipc *ipc, struct bflb_ipc_chan_info *chaninfo) {
+	struct bflb_ipc_chan_info *mchan;
+	struct mbox_controller *mboxctlr = &ipc->mboxctlr;
+	struct mbox_chan *chan;
+	struct device *dev;
+	int chan_id;
+
+	dev = ipc->dev;
+
+	//dev_dbg(dev, "%s Find Chan %d %d %d\n", __func__, chaninfo->cpu_id, chaninfo->service_id, chaninfo->op_id);
+
+	for (chan_id = 0; chan_id < mboxctlr->num_chans; chan_id++) {
+		chan = &ipc->chans[chan_id];
+		mchan = chan->con_priv;
+
+		if (!mchan)
+			break;
+		else if (mchan->cpu_id == chaninfo->cpu_id &&
+				mchan->service_id == chaninfo->service_id &&
+					mchan->op_id == chaninfo->op_id)
+			return chan;
+	}
+	dev_err(dev, "%s: No channel found for cpu_id %d service_id %d op_id %d", 
+		__func__, chaninfo->cpu_id, chaninfo->service_id, chaninfo->op_id);
+
+	return ERR_PTR(-EINVAL);
+
+}
+
+/* called when we get a RX interrupt from another processor
+ * this indicates there is a message waitinf for us in
+ * IPC_REG_ILSHR and IPC_REG_ILSLR registers to process  
  */
-
-static void bflb_mbox_poll(struct bflb_ipc *ipc)
+static void bflb_mbox_rx_irq_fn(int from_cpu, struct bflb_ipc *ipc)
 {
+	struct mbox_chan *chan;
+	struct bflb_ipc_chan_info bflbchan;
 
-	u32 signal = readl(ipc->base[1] + IPC_REG_ILSHR);
-	u32 source = readl(ipc->base[1] + IPC_REG_ILSLR);
+	/* update this when we support LP */
+	u32 sig_op = readl(ipc->base[1] + IPC_REG_ILSHR);
+	u32 param = readl(ipc->base[1] + IPC_REG_ILSLR);
 
-	dev_dbg(ipc->dev, "signal: 0x%08x, source: 0x%08x\r\n", signal, source);
+	WARN_ON(sig_op == 0);
 
-	mbox_chan_received_data(&ipc->chans[0], signal);
 
-	/* clear the IPC_REG_ILSLR and IPC_REG_ILSHR */
-	writel(0, ipc->base[1] + IPC_REG_ILSLR);
-	writel(0, ipc->base[1] + IPC_REG_ILSHR);
+	bflbchan.cpu_id = from_cpu;
+	bflbchan.service_id = (sig_op >> 16) & 0xFFFF;
+	bflbchan.op_id = sig_op & 0xFFFF;
+
+
+	chan = bflb_mbox_find_chan(ipc, &bflbchan);
+	if (IS_ERR(chan)) {
+		dev_err(ipc->dev, "no channel for signal cpu_id: %d service: %d op: %d\r\n", bflbchan.cpu_id, bflbchan.service_id, bflbchan.op_id);
+		return;
+	}
+
+	dev_info(ipc->dev, "Got MBOX Signal cpu: %d service %d op %d param %x\r\n", bflbchan.cpu_id, bflbchan.service_id, bflbchan.op_id, param);
+
+	mbox_chan_received_data(chan, param);
+
+	dev_info(ipc->dev, "bflb_mbox_rx\r\n");
 
 	return;
 }
 
+/* called when we get a interupt back on our TX IRQ.
+ * This is usualy a EOI interupt 
+ */
+static void bflb_mbox_tx_irq_fn(u8 from_cpu, struct bflb_ipc *ipc)
+{
+	struct mbox_chan *chan;
+	struct bflb_ipc_chan_info bflbchan;
+
+	u32 sig_op = readl(ipc->base[2] + IPC_REG_ILSHR);
+
+	bflbchan.cpu_id = from_cpu;
+	bflbchan.service_id = (sig_op >> 16) & 0xFFFF;
+	bflbchan.op_id = sig_op & 0xFFFF;
+
+	chan = bflb_mbox_find_chan(ipc, &bflbchan);
+	if (IS_ERR(chan)) {
+		dev_err(ipc->dev, "no channel for EOI signal cpu_id: %d service: %d op: %d\r\n", bflbchan.cpu_id, bflbchan.service_id, bflbchan.op_id);
+		return;
+	}
+
+	dev_info(ipc->dev, "Got MBOX EOI Signal cpu: %d service %d op %d\r\n", bflbchan.cpu_id, bflbchan.service_id, bflbchan.op_id);
+
+	mbox_chan_txdone(chan, 0);
+
+	return;
+}
 
 static irqreturn_t bflb_ipc_irq_fn(int irq, void *data)
 {
@@ -118,20 +190,19 @@ static irqreturn_t bflb_ipc_irq_fn(int irq, void *data)
 
 	stat = readl(ipc->base[1] + IPC_REG_ISR);
 
-
-	/*JH: I'm guessing there is a better way to pull out the mailbox IPC from others ?*/
-
 	for_each_set_bit(pos, &stat, 32) {
-		if (pos == BFLB_IPC_DEVICE_MBOX)
-			bflb_mbox_poll(ipc);
+		if (pos == BFLB_IPC_DEVICE_MBOX_RX)
+			bflb_mbox_rx_irq_fn(BFLB_IPC_SOURCE_M0, ipc);
+		else if (pos == BFLB_IPC_DEVICE_MBOX_TX)
+			/* we use target here as its a EOI from a send */
+			bflb_mbox_tx_irq_fn(BFLB_IPC_TARGET_M0, ipc);
 		else 
 			generic_handle_domain_irq(ipc->irq_domain, pos);
 	}
 	writel(stat, ipc->base[1] + IPC_REG_ICR);
 
-	/* EOI the irqs except our MBOX */
-	/* JH: I don't EOI the mailbox, I just look to see if the High/Low registers are cleared on M0 side */
-	if (stat != (1 << BFLB_IPC_DEVICE_MBOX))
+	/* Signal EOI to the other processes except when we recieve a EOI ourselves */
+	if (stat != (1 << BFLB_IPC_DEVICE_MBOX_TX))
 		writel(stat, ipc->base[2] + IPC_REG_ISWR);
 
 	return IRQ_HANDLED;
@@ -213,23 +284,20 @@ static int bflb_ipc_mbox_send_data(struct mbox_chan *chan, void *data)
 {
 	struct bflb_ipc *ipc = to_bflb_ipc(chan->mbox);
 	struct bflb_ipc_chan_info *mchan = chan->con_priv;
+	int *param = data;
+	u32 tmpVal = (mchan->service_id << 16) | (mchan->op_id & 0xFFFF);
 
-	if (!bflb_ipc_mbox_can_send(chan)) {
-		dev_dbg(ipc->dev, "MBOX is busy");
-		return -EBUSY;
-	}
+	dev_dbg(ipc->dev, "%s: cpu: %d singal: %d op: %d (0x%x) param: %d\n", __func__, mchan->cpu_id, mchan->service_id, mchan->op_id, tmpVal, *param);
 
-	dev_dbg(ipc->dev, "%s: %d %d\n", __func__, mchan->client_id, mchan->signal_id);
-
-
+ 
 	// /* write our signal number to high register */
-	writel(mchan->signal_id, ipc->base[2] + IPC_REG_ILSHR);
+	writel(tmpVal, ipc->base[2] + IPC_REG_ILSHR);
 	// /* write our data to low register */
-	writel((u32)data, ipc->base[2] + IPC_REG_ILSLR);
+	writel(*param, ipc->base[2] + IPC_REG_ILSLR);
 
 	/* and now kick the remote processor */
-	writel((1 << BFLB_IPC_DEVICE_MBOX), ipc->base[2] + IPC_REG_ISWR);
-
+	writel((1 << BFLB_IPC_DEVICE_MBOX_TX), ipc->base[2] + IPC_REG_ISWR);
+	dev_dbg(ipc->dev, "%s: done\r\n", __func__);
 	return 0;
 }
 
@@ -239,44 +307,54 @@ static void bflb_ipc_mbox_shutdown(struct mbox_chan *chan)
 	chan->con_priv = NULL;
 }
 
-static struct mbox_chan *bflb_ipc_mbox_xlate(struct mbox_controller *mbox,
+static struct mbox_chan *bflb_ipc_mbox_xlate(struct mbox_controller *mboxctlr,
 					const struct of_phandle_args *ph)
 {
-	struct bflb_ipc *ipc = to_bflb_ipc(mbox);
+	struct bflb_ipc *ipc = to_bflb_ipc(mboxctlr);
 	struct bflb_ipc_chan_info *mchan;
 	struct mbox_chan *chan;
-	struct device *dev;
+	struct device *dev = ipc->dev;
 	int chan_id;
 
-	dev = ipc->dev;
 
 	dev_dbg(dev, "%s\n", __func__);
 
-	if (ph->args_count != 2)
+	if (ph->args_count != 3) {
+		pr_debug("invalid number of arguments");
 		return ERR_PTR(-EINVAL);
+	}
 
-	for (chan_id = 0; chan_id < mbox->num_chans; chan_id++) {
+	for (chan_id = 0; chan_id < mboxctlr->num_chans; chan_id++) {
 		chan = &ipc->chans[chan_id];
 		mchan = chan->con_priv;
 
 		if (!mchan)
 			break;
-		else if (mchan->client_id == ph->args[0] &&
-				mchan->signal_id == ph->args[1])
-			return ERR_PTR(-EBUSY);
+		else if (mchan->cpu_id == ph->args[0] &&
+				mchan->service_id == ph->args[1] &&
+					mchan->op_id == ph->args[2]) {
+						pr_debug("channel already in use %d %d %d", ph->args[0], ph->args[1], ph->args[2]);
+						return ERR_PTR(-EBUSY);
+					}
 	}
 
-	if (chan_id >= mbox->num_chans)
+	if (chan_id >= mboxctlr->num_chans) {
+		pr_debug("no free channels");
 		return ERR_PTR(-EBUSY);
+	}
 
 	mchan = devm_kzalloc(dev, sizeof(*mchan), GFP_KERNEL);
-	if (!mchan)
+	if (!mchan) {
+		pr_debug("no memory for channel");
 		return ERR_PTR(-ENOMEM);
-
-	mchan->client_id = ph->args[0];
-	mchan->signal_id = ph->args[1];
+	}
+	mchan->cpu_id = ph->args[0];
+	mchan->service_id = ph->args[1];
+	mchan->op_id = ph->args[2];
 	chan->con_priv = mchan;
-
+	
+	dev_dbg(dev, "%s mbox %s: %d cpu: %d service: %d op: %d", __func__, ph->np->full_name, chan_id, mchan->cpu_id, mchan->service_id, mchan->op_id);
+	
 	return chan;
 }
 
@@ -284,7 +362,7 @@ static struct mbox_chan *bflb_ipc_mbox_xlate(struct mbox_controller *mbox,
 static const struct mbox_chan_ops ipc_mbox_chan_ops = {
 	.send_data = bflb_ipc_mbox_send_data,
 	.shutdown = bflb_ipc_mbox_shutdown,
-	.last_tx_done = bflb_ipc_mbox_can_send,
+//	.last_tx_done = bflb_ipc_mbox_can_send,
 };
 
 static int bflb_ipc_setup_mbox(struct bflb_ipc *ipc,
@@ -292,14 +370,13 @@ static int bflb_ipc_setup_mbox(struct bflb_ipc *ipc,
 {
 	struct of_phandle_args curr_ph;
 	struct device_node *client_dn;
-	struct mbox_controller *mbox;
+	struct mbox_controller *mboxctlr;
 	struct device *dev = ipc->dev;
 	int i, j, ret;
 
 	/*
 	 * Find out the number of clients interested in this mailbox
 	 * and create channels accordingly.
-	 * JH: How do we allocate them so we can lookup by name?
 	 */
 	ipc->num_chans = 0;
 	for_each_node_with_property(client_dn, "mboxes") {
@@ -313,7 +390,7 @@ static int bflb_ipc_setup_mbox(struct bflb_ipc *ipc,
 			of_node_put(curr_ph.np);
 			if (!ret && curr_ph.np == controller_dn) {
 				ipc->num_chans++;
-				break;
+				//break;
 			}
 		}
 	}
@@ -327,14 +404,14 @@ static int bflb_ipc_setup_mbox(struct bflb_ipc *ipc,
 	if (!ipc->chans)
 		return -ENOMEM;
 
-	mbox = &ipc->mbox;
-	mbox->dev = dev;
-	mbox->num_chans = ipc->num_chans;
-	mbox->chans = ipc->chans;
-	mbox->ops = &ipc_mbox_chan_ops;
-	mbox->of_xlate = bflb_ipc_mbox_xlate;
-	mbox->txdone_irq = false;
-	mbox->txdone_poll = true;
+	mboxctlr = &ipc->mboxctlr;
+	mboxctlr->dev = dev;
+	mboxctlr->num_chans = ipc->num_chans;
+	mboxctlr->chans = ipc->chans;
+	mboxctlr->ops = &ipc_mbox_chan_ops;
+	mboxctlr->of_xlate = bflb_ipc_mbox_xlate;
+	mboxctlr->txdone_irq = true;
+//	mboxctlr->txdone_poll = false;
 
 
 
@@ -343,9 +420,10 @@ static int bflb_ipc_setup_mbox(struct bflb_ipc *ipc,
 	writel(0, ipc->base[2] + IPC_REG_ILSHR);
 
 	/* unmask our interupt */
-	writel(BIT(BFLB_IPC_DEVICE_MBOX), ipc->base[1] + IPC_REG_IUSR);
+	writel(BIT(BFLB_IPC_DEVICE_MBOX_TX), ipc->base[1] + IPC_REG_IUSR);
+	writel(BIT(BFLB_IPC_DEVICE_MBOX_RX), ipc->base[1] + IPC_REG_IUSR);
 
-	return devm_mbox_controller_register(dev, mbox);
+	return devm_mbox_controller_register(dev, mboxctlr);
 }
 
 static int bflb_ipc_pm_resume(struct device *dev)
@@ -405,7 +483,7 @@ static int bflb_ipc_probe(struct platform_device *pdev)
 
 err_req_irq:
 	if (ipc->num_chans)
-		mbox_controller_unregister(&ipc->mbox);
+		mbox_controller_unregister(&ipc->mboxctlr);
 err_mbox:
 	irq_domain_remove(ipc->irq_domain);
 

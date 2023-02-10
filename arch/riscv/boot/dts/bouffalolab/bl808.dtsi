@@ -104,7 +104,7 @@
 			interrupts-extended = <&ipclic BFLB_IPC_SOURCE_M0
 								BFLB_IPC_DEVICE_UART2
 								IRQ_TYPE_EDGE_RISING>;
-			mboxes = <&ipclic BFLB_IPC_SOURCE_M0 BFLB_IPC_DEVICE_UART2>;
+/* 			mboxes = <&ipclic BFLB_IPC_SOURCE_M0 BFLB_IPC_DEVICE_UART2 0>;  */
 			clocks = <&xtal>;
 			status = "disabled";
 		};
@@ -115,7 +115,7 @@
 			interrupts-extended = <&ipclic BFLB_IPC_SOURCE_M0
 						       BFLB_IPC_DEVICE_SDHCI
 						       IRQ_TYPE_EDGE_RISING>;
-			mboxes = <&ipclic BFLB_IPC_SOURCE_M0 BFLB_IPC_DEVICE_SDHCI>;
+/*			mboxes = <&ipclic BFLB_IPC_SOURCE_M0 BFLB_IPC_DEVICE_SDHCI 0>; */
 			clocks = <&sdh>;
 			status = "disabled";
 		};
@@ -149,7 +149,7 @@
 			interrupts = <54 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-controller;
 			#interrupt-cells = <3>;
-			#mbox-cells = <2>;
+			#mbox-cells = <3>;
 			status = "disabled";
 		};
 
@@ -171,12 +171,13 @@
 										<&cpu0_intc 7>;
 		};
 
-
 		rproc: rproc@22054000 {
 			compatible = "bflb,bl808-rproc";
 			reg = <0x22054000 0x4000>;
 			memory-region = <&vdev0vring0>, <&vdev0vring1>, <&vdev0buffer>;
-			mboxes = <&ipclic BFLB_IPC_TARGET_M0 BFLB_IPC_MBOX_VIRTIO_KICK>;
+			mboxes = <&ipclic BFLB_IPC_TARGET_M0 BFLB_IPC_MBOX_VIRTIO BFLB_IPC_MBOX_VIRTIO_OP_KICK>, 
+				<&ipclic BFLB_IPC_SOURCE_M0 BFLB_IPC_MBOX_VIRTIO BFLB_IPC_MBOX_VIRTIO_OP_KICK>;
+			mbox-names = "virtio-tx", "virtio-rx";
 
 			status = "disabled";
 		};

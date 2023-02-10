@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Remote processor machine-specific module for bl808
+ * Remote processor machine-specific module for bflb
  *
  * Copyright (C) 2023 Justin Hammond
  */
@@ -18,11 +18,11 @@
 #include <linux/platform_device.h>
 #include <linux/remoteproc.h>
 #include <linux/mailbox_client.h>
-
+#include <linux/delay.h>
 #include "remoteproc_internal.h"
 
 /**
- * struct bl808_mbox - bl808 mailbox instance state
+ * struct bflb_mbox - bflb mailbox instance state
  * @name: the name of the mailbox
  * @client: the mailbox client
  * @chan: the mailbox channel
@@ -30,8 +30,8 @@
  * @vq_id: the virtqueue id
  */
 
-struct bl808_mbox {
-	const unsigned char name[10];
+struct bflb_mbox {
+	unsigned char name[10];
 	struct mbox_client client;
 	struct mbox_chan *chan;
 	struct work_struct vq_work;
@@ -40,14 +40,15 @@ struct bl808_mbox {
 
 
 /**
- * struct bl808_rproc - bl808 remote processor instance state
+ * struct bflb_rproc - bflb remote processor instance state
  * @rproc: rproc handle
  * @mbox: the mailbox channel
  * @client: the mailbox client
  */
-struct bl808_rproc {
+struct bflb_rproc {
 	struct rproc *rproc;
-	struct bl808_mbox mbox;
+	struct bflb_mbox mbox_rx;
+	struct bflb_mbox mbox_tx;
 	struct workqueue_struct *workqueue;
 };
 
@@ -124,14 +125,14 @@ struct remote_resource_table resources = {
 };
 
 /* return a pointer to our resource table */
-struct resource_table *bl808_rproc_get_loaded_rsc_table(struct rproc *rproc, size_t *size)
+struct resource_table *bflb_rproc_get_loaded_rsc_table(struct rproc *rproc, size_t *size)
 {
 	*size = sizeof(resources);
 	return (struct resource_table *)&resources;
 }
 
 /* allocate vdev0buffer */
-static int bl808_rproc_mem_alloc(struct rproc *rproc,
+static int bflb_rproc_mem_alloc(struct rproc *rproc,
 			      struct rproc_mem_entry *mem)
 {
 	struct device *dev = rproc->dev.parent;
@@ -151,7 +152,7 @@ static int bl808_rproc_mem_alloc(struct rproc *rproc,
 }
 
 /* release vdev0buffer */
-static int bl808_rproc_mem_release(struct rproc *rproc,
+static int bflb_rproc_mem_release(struct rproc *rproc,
 				struct rproc_mem_entry *mem)
 {
 	iounmap(mem->va);
@@ -163,7 +164,7 @@ static int bl808_rproc_mem_release(struct rproc *rproc,
  * Pull the memory ranges for virtio from the device tree and register them.
  * Called as prepare.
  */
-static int bl808_rproc_setupmem(struct rproc *rproc)
+static int bflb_rproc_setupmem(struct rproc *rproc)
 {
 	struct device *dev = rproc->dev.parent;
 	struct device_node *np = dev->of_node;
@@ -188,8 +189,8 @@ static int bl808_rproc_setupmem(struct rproc *rproc)
 			mem = rproc_mem_entry_init(dev, NULL,
 						   (dma_addr_t)rmem->base,
 						   rmem->size, rmem->base,
-						   bl808_rproc_mem_alloc,
-						   bl808_rproc_mem_release,
+						   bflb_rproc_mem_alloc,
+						   bflb_rproc_mem_release,
 						   it.node->name);
 		} else {
 			/* Register reserved memory for vdev buffer allocation */
@@ -212,94 +213,94 @@ static int bl808_rproc_setupmem(struct rproc *rproc)
 
 /* M0 is already started. Do Nothing
  */
-static int bl808_rproc_start(struct rproc *rproc)
+static int bflb_rproc_start(struct rproc *rproc)
 {
 	struct device *dev = rproc->dev.parent;
 
-	dev_dbg(dev, "bl808_rproc_start");
+	dev_dbg(dev, "bflb_rproc_start");
 
 	return 0;
 }
 
 /* We don't want to stop M0, as it will crash. Do Nothing */
-static int bl808_rproc_stop(struct rproc *rproc)
+static int bflb_rproc_stop(struct rproc *rproc)
 {
 	struct device *dev = rproc->dev.parent;
 
-	dev_dbg(dev, "bl808_rproc_stop");
+	dev_dbg(dev, "bflb_rproc_stop");
 
 	return 0;
 }
 
+#include <linux/mailbox_controller.h>
+
 /* kick the virtqueue to let M0 know there is a update to the vring */
-static void bl808_rproc_kick(struct rproc *rproc, int vqid)
+static void bflb_rproc_send_kick(struct rproc *rproc, int vqid)
 {
 	struct device *dev = rproc->dev.parent;
-	struct bl808_rproc *drproc = (struct bl808_rproc *)rproc->priv;
+	struct bflb_rproc *drproc = (struct bflb_rproc *)rproc->priv;
+	struct bflb_mbox *mb = &drproc->mbox_tx;
+	struct mbox_chan *chan = mb->chan;
+	int ret;
+
 
 	/* Kick the other CPU to let it know the vrings are updated */
-	dev_dbg(dev, "%s %d", __func__, vqid);
-	mbox_send_message(drproc->mbox.chan, (void *)vqid);
+	dev_info(dev, "%s Mailbox: %s %d", __func__, mb->name, vqid);
+	ret = mbox_send_message(chan, &vqid);
+	if (!ret) {
+		dev_err(dev, "%s Mailbox %s sending %d Failed: %d", __func__, mb->name, vqid, ret);
+	} else { 
+		dev_info(dev, "%s Mailbox %s done %d size: %d free: %d: %d", __func__, mb->name, vqid, chan->msg_count, chan->msg_free, ret);
+	}
 }
 
-static void bflb_rproc_mb_vq_work(struct work_struct *work)
+
+static void bflb_rproc_recv_kick(struct work_struct *work)
 {
-	struct bl808_mbox *mb = container_of(work, struct bl808_mbox, vq_work);
+	struct bflb_mbox *mb = container_of(work, struct bflb_mbox, vq_work);
 	struct rproc *rproc = dev_get_drvdata(mb->client.dev);
+
+	dev_info(rproc->dev.parent, "%s mailbox: %s: %d", __func__, mb->name, mb->vq_id);
 
 	if (rproc_vq_interrupt(rproc, mb->vq_id) == IRQ_NONE)
 		dev_dbg(&rproc->dev, "no message found in vq%d\n", mb->vq_id);
 }
 
-
 /* M0 signaled us there is a update on the vring, check it
  */
-static void bflb_rproc_mbox_callback(struct mbox_client *client, void *data)
+static void bflb_rproc_rx_mbox_callback(struct mbox_client *client, void *data)
 {
 	struct device *dev = client->dev;
 	struct rproc *rproc = dev_get_drvdata(dev);
-	struct bl808_rproc *drproc = (struct bl808_rproc *)rproc->priv;
-	struct bl808_mbox *mb = &drproc->mbox;
+	struct bflb_rproc *drproc = (struct bflb_rproc *)rproc->priv;
+	struct bflb_mbox *mb = &drproc->mbox_rx;
 
-	mb->vq_id = (u32)data;
+	mb->vq_id = (int)data;
+
+	dev_info(dev, "%s mailbox %s: %d", __func__, mb->name, mb->vq_id);
+
+
 
 	queue_work(drproc->workqueue, &mb->vq_work);
+	mbox_chan_txdone(mb->chan, 0);
 }
 
 /* M0 is already running when we boot
  * so just attach to it.
  * we also register a mailbox to get kicks from M0 when vrings are updated
  */
-static int bl808_rproc_attach(struct rproc *rproc)
+static int bflb_rproc_attach(struct rproc *rproc)
 {
 	struct device *dev = &rproc->dev;
-	struct bl808_rproc *drproc = (struct bl808_rproc *)rproc->priv;
-	struct mbox_client *vq1_mbox = &drproc->mbox.client;
-	struct bl808_mbox *chan = &drproc->mbox;
-	int ret;
+//	struct bflb_rproc *drproc = (struct bflb_rproc *)rproc->priv;
 
-	/* request the mailboxs */
-	vq1_mbox->dev = dev->parent;
-	vq1_mbox->tx_done = NULL;
-	vq1_mbox->rx_callback = bflb_rproc_mbox_callback;
-	vq1_mbox->tx_block = false;
-	vq1_mbox->knows_txdone = false;
-
-	chan->chan = mbox_request_channel(vq1_mbox, 0);
-	if (IS_ERR(chan->chan)) {
-		ret = -EBUSY;
-		dev_err(dev, "mbox_request_channel failed: %ld\n",
-			PTR_ERR(chan->chan));
-		return ret;
-	}
-	INIT_WORK(&chan->vq_work, bflb_rproc_mb_vq_work);
 	dev_info(dev, "Attaching to %s", rproc->name);
 
 	return 0;
 }
 
 /* Detach. Do Nothing? */
-static int bl808_rproc_detach(struct rproc *rproc)
+static int bflb_rproc_detach(struct rproc *rproc)
 {
 	struct device *dev = rproc->dev.parent;
 
@@ -307,25 +308,79 @@ static int bl808_rproc_detach(struct rproc *rproc)
 	return 0;
 }
 
-static const struct rproc_ops bl808_rproc_ops = {
-	.start = bl808_rproc_start,
-	.stop = bl808_rproc_stop,
-	.attach = bl808_rproc_attach,
-	.detach = bl808_rproc_detach,
-	.kick = bl808_rproc_kick,
-	.prepare = bl808_rproc_setupmem,
-	.get_loaded_rsc_table = bl808_rproc_get_loaded_rsc_table,
+static const struct rproc_ops bflb_rproc_ops = {
+	.start = bflb_rproc_start,
+	.stop = bflb_rproc_stop,
+	.attach = bflb_rproc_attach,
+	.detach = bflb_rproc_detach,
+	.kick = bflb_rproc_send_kick,
+	.prepare = bflb_rproc_setupmem,
+	.get_loaded_rsc_table = bflb_rproc_get_loaded_rsc_table,
 };
 
+static int bflb_rproc_setup_mbox(struct rproc *rproc) {
+	struct bflb_rproc *drproc = (struct bflb_rproc *)rproc->priv;
 
-static int bl808_rproc_probe(struct platform_device *pdev)
+	struct bflb_mbox *tx_bflb_mbox = &drproc->mbox_tx;
+	struct mbox_client *tx_mbox_cl = &tx_bflb_mbox->client;
+
+	struct bflb_mbox *rx_bflb_mbox = &drproc->mbox_rx;
+	struct mbox_client *rx_mbox_cl = &rx_bflb_mbox->client;
+
+	struct device *dev = &rproc->dev;
+	int ret = 0;
+
+	dev_dbg(dev, "bflb_rpoc_setup_mbox");
+
+	/* request the TX mailboxs */
+	tx_mbox_cl->dev = dev->parent;
+	tx_mbox_cl->tx_block = true;
+	tx_mbox_cl->tx_tout = 100;
+	strncpy(tx_bflb_mbox->name, "virtio-tx", sizeof(tx_bflb_mbox->name));
+	tx_bflb_mbox->chan = mbox_request_channel_byname(tx_mbox_cl, "virtio-tx");
+	if (IS_ERR(tx_bflb_mbox->chan)) {
+		ret = -EBUSY;
+		dev_err(dev, "mbox_request_channel tx failed: %ld\n",
+			PTR_ERR(tx_bflb_mbox->chan));
+		goto del_rx_mbox;
+	}
+
+	/* request the RX mailboxs */
+	rx_mbox_cl->dev = dev->parent;
+	rx_mbox_cl->rx_callback = bflb_rproc_rx_mbox_callback;
+	rx_mbox_cl->tx_block = true;
+	strncpy(rx_bflb_mbox->name, "virtio-rx", sizeof(rx_bflb_mbox->name));
+
+	rx_bflb_mbox->chan = mbox_request_channel_byname(rx_mbox_cl, "virtio-rx");
+	if (IS_ERR(rx_bflb_mbox->chan)) {
+		ret = -EBUSY;
+		dev_err(dev, "mbox_request_channel rx failed: %ld\n",
+			PTR_ERR(rx_bflb_mbox->chan));
+		goto del_tx_mbox;
+	}
+	INIT_WORK(&rx_bflb_mbox->vq_work, bflb_rproc_recv_kick);
+
+	dev_dbg(dev, "bflb_rpoc_setup_mbox done");
+
+	return ret;
+
+del_tx_mbox:
+	mbox_free_channel(tx_bflb_mbox->chan);
+del_rx_mbox:
+	mbox_free_channel(rx_bflb_mbox->chan);
+	return ret;
+}
+
+static int bflb_rproc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	struct bl808_rproc *drproc;
+	struct bflb_rproc *drproc;
 	struct rproc *rproc;
 	int ret;
 
-	rproc = rproc_alloc(dev, "M0", &bl808_rproc_ops, NULL,
+	dev_dbg(dev, "bflb_rproc_probe");
+
+	rproc = rproc_alloc(dev, "M0", &bflb_rproc_ops, NULL,
 		sizeof(*drproc));
 	if (!rproc) {
 		ret = -ENOMEM;
@@ -342,6 +397,7 @@ static int bl808_rproc_probe(struct platform_device *pdev)
 	drproc = rproc->priv;
 	drproc->rproc = rproc;
 	rproc->has_iommu = false;
+	platform_set_drvdata(pdev, rproc);
 
 	drproc->workqueue = create_workqueue(dev_name(dev));
 	if (!drproc->workqueue) {
@@ -350,38 +406,45 @@ static int bl808_rproc_probe(struct platform_device *pdev)
 		goto free_wkq;
 	}
 
+	ret = bflb_rproc_setup_mbox(rproc);
+	if (ret) {
+		dev_err(dev, "bflb_rpoc_setup_mbox failed: %d\n", ret);
+		goto free_rproc;
+	}
+
 	ret = rproc_add(rproc);
 	if (ret) {
 		dev_err(dev, "rproc_add failed: %d\n", ret);
 		goto free_rproc;
 	}
 
-	platform_set_drvdata(pdev, rproc);
-
 	dev_info(dev, "Bouffalo Labs Remote Processor Control Driver Started");
 
 	return 0;
 
-free_wkq:
-	destroy_workqueue(drproc->workqueue);
 free_rproc:
 	rproc_free(rproc);
+free_wkq:
+	destroy_workqueue(drproc->workqueue);
 free_mem:
 	if (dev->of_node)
 		of_reserved_mem_device_release(dev);
 	return ret;
 }
 
-static int bl808_rproc_remove(struct platform_device *pdev)
+static int bflb_rproc_remove(struct platform_device *pdev)
 {
 	struct rproc *rproc = platform_get_drvdata(pdev);
-	struct bl808_rproc *drproc = (struct bl808_rproc *)rproc->priv;
+	struct bflb_rproc *drproc = (struct bflb_rproc *)rproc->priv;
+	struct bflb_mbox *tx_bflb_mbox = &drproc->mbox_tx;
+	struct bflb_mbox *rx_bflb_mbox = &drproc->mbox_rx;
 	struct device *dev = &pdev->dev;
 
 	dev_info(dev, "Bouffalo Labs Remote Processor Control Driver Removed");
 
-	/*XXX TODO: we need to unregister our mailbox? */
 
+	mbox_free_channel(tx_bflb_mbox->chan);
+	mbox_free_channel(rx_bflb_mbox->chan);
 	destroy_workqueue(drproc->workqueue);
 
 	rproc_del(rproc);
@@ -398,17 +461,17 @@ static const struct of_device_id davinci_rproc_of_match[] __maybe_unused = {
 };
 MODULE_DEVICE_TABLE(of, davinci_rproc_of_match);
 
-static struct platform_driver bl808_rproc_driver = {
-	.probe = bl808_rproc_probe,
-	.remove = bl808_rproc_remove,
+static struct platform_driver bflb_rproc_driver = {
+	.probe = bflb_rproc_probe,
+	.remove = bflb_rproc_remove,
 	.driver = {
 		.name = "bl808-rproc",
 		.of_match_table = of_match_ptr(davinci_rproc_of_match),
 	},
 };
 
-module_platform_driver(bl808_rproc_driver);
+module_platform_driver(bflb_rproc_driver);
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("justin@dynam.ac");
-MODULE_DESCRIPTION("bl808 Remote Processor control driver");
+MODULE_DESCRIPTION("bflb Remote Processor control driver");
