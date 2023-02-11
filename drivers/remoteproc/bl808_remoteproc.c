@@ -18,7 +18,9 @@
 #include <linux/platform_device.h>
 #include <linux/remoteproc.h>
 #include <linux/mailbox_client.h>
+#include <linux/mailbox_controller.h>
 #include <linux/delay.h>
+#include <linux/bflb-mailbox.h>
 #include "remoteproc_internal.h"
 
 /**
@@ -232,8 +234,6 @@ static int bflb_rproc_stop(struct rproc *rproc)
 	return 0;
 }
 
-#include <linux/mailbox_controller.h>
-
 /* kick the virtqueue to let M0 know there is a update to the vring */
 static void bflb_rproc_send_kick(struct rproc *rproc, int vqid)
 {
@@ -241,27 +241,51 @@ static void bflb_rproc_send_kick(struct rproc *rproc, int vqid)
 	struct bflb_rproc *drproc = (struct bflb_rproc *)rproc->priv;
 	struct bflb_mbox *mb = &drproc->mbox_tx;
 	struct mbox_chan *chan = mb->chan;
+	struct bflb_mbox_msg *msg;
 	int ret;
+	int i;
+	static int count;
 
+	/* just for debugging atm */
+	count++;
 
+	msg = kzalloc(sizeof(struct bflb_mbox_msg), GFP_KERNEL);
+	if (!msg)
+		return;
+
+	/* we need a small delay before kicking the other side 
+	 * (I assume to allow the ring to update/flush etc?)
+	 * without this, we get lots of "empty ring" messages on the 
+	 * other side
+	 */
+	mdelay(1);
+
+	msg->param = vqid;
+	msg->id = count;
 	/* Kick the other CPU to let it know the vrings are updated */
-	dev_info(dev, "%s Mailbox: %s %d", __func__, mb->name, vqid);
-	ret = mbox_send_message(chan, &vqid);
-	if (!ret) {
-		dev_err(dev, "%s Mailbox %s sending %d Failed: %d", __func__, mb->name, vqid, ret);
-	} else { 
-		dev_info(dev, "%s Mailbox %s done %d size: %d free: %d: %d", __func__, mb->name, vqid, chan->msg_count, chan->msg_free, ret);
+	dev_dbg(dev, "%s %d Mailbox: %s %d", __func__, msg->id, mb->name, msg->param);
+	/* we occasionally get a EOI timeout, so retry upto 3 times */
+	for (i = 0; i < 3; i++) {
+		ret = mbox_send_message(chan, msg);
+		if (ret >= 0)
+			goto done;
+		dev_warn(dev, "%s %d Mailbox %s sending %d Failed: %d - Retrying %d", __func__, msg->id, mb->name, msg->param, ret, i);
 	}
+done:
+	dev_dbg(dev, "%s %d Mailbox %s done %d: %d", __func__, msg->id, mb->name, msg->param, ret);
+	kfree(msg);
 }
-
 
 static void bflb_rproc_recv_kick(struct work_struct *work)
 {
 	struct bflb_mbox *mb = container_of(work, struct bflb_mbox, vq_work);
 	struct rproc *rproc = dev_get_drvdata(mb->client.dev);
 
-	dev_info(rproc->dev.parent, "%s mailbox: %s: %d", __func__, mb->name, mb->vq_id);
+	dev_dbg(rproc->dev.parent, "%s mailbox: %s: %d", __func__, mb->name, mb->vq_id);
 
+	/* not a bad thing if there is no messages, probably
+	 * means that the previous ring kick processed the message
+	 */
 	if (rproc_vq_interrupt(rproc, mb->vq_id) == IRQ_NONE)
 		dev_dbg(&rproc->dev, "no message found in vq%d\n", mb->vq_id);
 }
@@ -274,12 +298,11 @@ static void bflb_rproc_rx_mbox_callback(struct mbox_client *client, void *data)
 	struct rproc *rproc = dev_get_drvdata(dev);
 	struct bflb_rproc *drproc = (struct bflb_rproc *)rproc->priv;
 	struct bflb_mbox *mb = &drproc->mbox_rx;
+	struct bflb_mbox_msg *msg = data;
 
-	mb->vq_id = (int)data;
+	mb->vq_id = msg->param;
 
-	dev_info(dev, "%s mailbox %s: %d", __func__, mb->name, mb->vq_id);
-
-
+	dev_dbg(dev, "%s mailbox %s: %d", __func__, mb->name, mb->vq_id);
 
 	queue_work(drproc->workqueue, &mb->vq_work);
 	mbox_chan_txdone(mb->chan, 0);
@@ -318,7 +341,8 @@ static const struct rproc_ops bflb_rproc_ops = {
 	.get_loaded_rsc_table = bflb_rproc_get_loaded_rsc_table,
 };
 
-static int bflb_rproc_setup_mbox(struct rproc *rproc) {
+static int bflb_rproc_setup_mbox(struct rproc *rproc)
+{
 	struct bflb_rproc *drproc = (struct bflb_rproc *)rproc->priv;
 
 	struct bflb_mbox *tx_bflb_mbox = &drproc->mbox_tx;
@@ -335,7 +359,7 @@ static int bflb_rproc_setup_mbox(struct rproc *rproc) {
 	/* request the TX mailboxs */
 	tx_mbox_cl->dev = dev->parent;
 	tx_mbox_cl->tx_block = true;
-	tx_mbox_cl->tx_tout = 100;
+	tx_mbox_cl->tx_tout = 200;
 	strncpy(tx_bflb_mbox->name, "virtio-tx", sizeof(tx_bflb_mbox->name));
 	tx_bflb_mbox->chan = mbox_request_channel_byname(tx_mbox_cl, "virtio-tx");
 	if (IS_ERR(tx_bflb_mbox->chan)) {
@@ -397,6 +421,8 @@ static int bflb_rproc_probe(struct platform_device *pdev)
 	drproc = rproc->priv;
 	drproc->rproc = rproc;
 	rproc->has_iommu = false;
+	rproc->sysfs_read_only = true;
+
 	platform_set_drvdata(pdev, rproc);
 
 	drproc->workqueue = create_workqueue(dev_name(dev));
@@ -456,7 +482,7 @@ static int bflb_rproc_remove(struct platform_device *pdev)
 }
 
 static const struct of_device_id davinci_rproc_of_match[] __maybe_unused = {
-	{ .compatible = "bflb,bl808-rproc", },
+	{ .compatible = "bflb,bflb-rproc", },
 	{ /* sentinel */ },
 };
 MODULE_DEVICE_TABLE(of, davinci_rproc_of_match);
@@ -465,7 +491,7 @@ static struct platform_driver bflb_rproc_driver = {
 	.probe = bflb_rproc_probe,
 	.remove = bflb_rproc_remove,
 	.driver = {
-		.name = "bl808-rproc",
+		.name = "bflb-rproc",
 		.of_match_table = of_match_ptr(davinci_rproc_of_match),
 	},
 };

@@ -172,7 +172,7 @@
 		};
 
 		rproc: rproc@22054000 {
-			compatible = "bflb,bl808-rproc";
+			compatible = "bflb,bflb-rproc";
 			reg = <0x22054000 0x4000>;
 			memory-region = <&vdev0vring0>, <&vdev0vring1>, <&vdev0buffer>;
 			mboxes = <&ipclic BFLB_IPC_TARGET_M0 BFLB_IPC_MBOX_VIRTIO BFLB_IPC_MBOX_VIRTIO_OP_KICK>, 
